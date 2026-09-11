@@ -1,4 +1,6 @@
 import type { McpExtensionState } from "./state.ts";
+import { getActiveMcpRuntimeOwnerCount } from "./runtime-owner.ts";
+import { getManagedMcpStdioProcessCount } from "./server-manager.ts";
 import { getAuthorizedToolMetadata } from "./tool-metadata.ts";
 import {
   MCP_STATUS_EVENT,
@@ -81,6 +83,8 @@ export function createMcpStatusSnapshot(state: McpExtensionState): McpStatusSnap
     totalResources,
     connectedCount,
     disabledCount,
+    activeOwnerCount: getActiveMcpRuntimeOwnerCount(),
+    managedStdioProcessCount: getManagedMcpStdioProcessCount(),
   };
 }
 
@@ -107,6 +111,8 @@ export function publishMcpStatusShutdown(events: McpStatusEventBus | undefined):
       totalResources: 0,
       connectedCount: 0,
       disabledCount: 0,
+      activeOwnerCount: getActiveMcpRuntimeOwnerCount(),
+      managedStdioProcessCount: getManagedMcpStdioProcessCount(),
     } satisfies McpStatusSnapshot);
   } catch {
     // Event consumers must not be able to interrupt MCP shutdown.

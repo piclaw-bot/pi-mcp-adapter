@@ -1,7 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
-import { combineAbortSignals, createMcpRuntimeOwner, createOwnedUi } from "../runtime-owner.ts";
+import { combineAbortSignals, createMcpRuntimeOwner, createOwnedUi, getActiveMcpRuntimeOwnerCount } from "../runtime-owner.ts";
 
 describe("MCP runtime ownership", () => {
+  it("reports active owners until each owner stops", async () => {
+    const baseline = getActiveMcpRuntimeOwnerCount();
+    const first = createMcpRuntimeOwner();
+    const second = createMcpRuntimeOwner();
+
+    expect(getActiveMcpRuntimeOwnerCount()).toBe(baseline + 2);
+    await first.stop("test");
+    expect(getActiveMcpRuntimeOwnerCount()).toBe(baseline + 1);
+    await second.stop("test");
+    expect(getActiveMcpRuntimeOwnerCount()).toBe(baseline);
+  });
+
   it("contains synchronous and asynchronous cleanup failures and is idempotent", async () => {
     const owner = createMcpRuntimeOwner();
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});

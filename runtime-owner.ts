@@ -9,6 +9,13 @@ export interface McpRuntimeOwner {
   throwIfInactive(): void;
 }
 
+const activeRuntimeOwners = new Set<McpRuntimeOwner>();
+
+/** Process-wide active owner count for sanitized lifecycle diagnostics. */
+export function getActiveMcpRuntimeOwnerCount(): number {
+  return activeRuntimeOwners.size;
+}
+
 export function createMcpRuntimeOwner(): McpRuntimeOwner {
   const controller = new AbortController();
   const cleanups: Array<() => void | Promise<void>> = [];
@@ -18,7 +25,7 @@ export function createMcpRuntimeOwner(): McpRuntimeOwner {
     console.error(`MCP: ${late ? "late " : ""}runtime cleanup failed: ${formatTerminalError(error)}`);
   };
 
-  return {
+  const owner: McpRuntimeOwner = {
     signal: controller.signal,
     isActive: () => !controller.signal.aborted,
     addCleanup: cleanup => {
@@ -31,6 +38,7 @@ export function createMcpRuntimeOwner(): McpRuntimeOwner {
     stop: (reason = "MCP extension runtime stopped") => {
       if (stopPromise) return stopPromise;
       controller.abort(new Error(reason));
+      activeRuntimeOwners.delete(owner);
       const pendingCleanups = cleanups.splice(0).reverse().map(cleanup =>
         Promise.resolve().then(cleanup),
       );
@@ -46,6 +54,8 @@ export function createMcpRuntimeOwner(): McpRuntimeOwner {
     },
     throwIfInactive: () => controller.signal.throwIfAborted(),
   };
+  activeRuntimeOwners.add(owner);
+  return owner;
 }
 
 export function combineAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {

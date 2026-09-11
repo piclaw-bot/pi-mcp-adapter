@@ -1,4 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
+
+// Keep this compatibility-branch suite independent of its known Vitest/Zod 4
+// root named-export optimizer defect (see proxy-tool-policy.test.ts).
+vi.mock("zod", async () => {
+  const actual = await vi.importActual<Record<string, unknown>>("zod/v4");
+  return { ...actual, z: actual.z ?? actual.default };
+});
+
 import {
   MCP_STATUS_EVENT,
   createMcpStatusSnapshot,
@@ -9,8 +17,10 @@ import {
 function createState() {
   const manager = {
     getConnection: vi.fn(),
+    getManagedStdioProcessCount: vi.fn(() => 2),
   };
   return {
+    owner: { isActive: vi.fn(() => true) },
     config: {
       mcpServers: {
         connected: { command: "node", headers: { Authorization: "secret" } },
@@ -57,6 +67,8 @@ describe("MCP status snapshots", () => {
       totalResources: 3,
       connectedCount: 1,
       disabledCount: 1,
+      activeOwnerCount: expect.any(Number),
+      managedStdioProcessCount: expect.any(Number),
     });
     expect(snapshot.servers).toEqual(expect.arrayContaining([
       { name: "connected", status: "connected", toolCount: 1, resourceCount: 2, disabled: false },
@@ -86,6 +98,8 @@ describe("MCP status snapshots", () => {
       totalResources: 0,
       connectedCount: 0,
       disabledCount: 0,
+      activeOwnerCount: expect.any(Number),
+      managedStdioProcessCount: expect.any(Number),
     });
   });
 
