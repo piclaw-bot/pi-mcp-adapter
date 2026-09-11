@@ -7,7 +7,7 @@ import { getServerPrefix, isServerDisabled, parseUiPromptHandoff } from "./types
 import { lazyConnect, markKeepAliveAfterConnect, notifyToolMetadataUpdated, updateServerMetadata, updateMetadataCache, getFailureAgeSeconds, updateStatusBar, clearFailure, recordFailure } from "./init.ts";
 import { abortable, throwIfAborted } from "./abort.ts";
 import { combineAbortSignals, isAbortError } from "./runtime-owner.ts";
-import { buildToolMetadata, getToolNames, findToolByName, formatSchema } from "./tool-metadata.ts";
+import { buildToolMetadata, getAuthorizedToolMetadata, getToolNames, findToolByName, formatSchema, isToolMetadataAuthorized, resolveToolRequestAuthorization } from "./tool-metadata.ts";
 import { reconstructPromptMetadata } from "./metadata-cache.ts";
 import { resolveMcpResultContent, transformMcpContent } from "./tool-registrar.ts";
 import { guardMcpOutput, guardedMcpDetails, resolveMcpOutputGuardOptions } from "./mcp-output-guard.ts";
@@ -238,8 +238,8 @@ export function executeStatus(state: McpExtensionState): ProxyToolResult {
     const definition = state.config.mcpServers[name];
     const disabled = isServerDisabled(definition);
     const connection = disabled ? undefined : state.manager.getConnection(name);
-    const metadata = disabled ? undefined : state.toolMetadata.get(name);
-    const toolCount = metadata?.length ?? 0;
+    const metadataPresent = !disabled && state.toolMetadata.has(name);
+    const toolCount = disabled ? 0 : getAuthorizedToolMetadata(state, name).length;
     const failedAgo = disabled ? null : getFailureAgeSeconds(state, name);
     let status = disabled ? "disabled" : "not connected";
     if (!disabled && connection?.status === "connected") {
@@ -248,7 +248,7 @@ export function executeStatus(state: McpExtensionState): ProxyToolResult {
       status = "needs-auth";
     } else if (!disabled && failedAgo !== null) {
       status = "failed";
-    } else if (!disabled && metadata !== undefined) {
+    } else if (!disabled && metadataPresent) {
       status = "cached";
     }
 
@@ -393,8 +393,8 @@ export function executeDescribe(state: McpExtensionState, toolName: string): Pro
   let toolMeta: ToolMetadata | undefined;
   let disabledMatch: string | undefined;
 
-  for (const [server, metadata] of state.toolMetadata.entries()) {
-    const found = findToolByName(metadata, toolName);
+  for (const [server] of state.toolMetadata.entries()) {
+    const found = findToolByName(getAuthorizedToolMetadata(state, server), toolName);
     if (!found) continue;
     if (isServerDisabled(state.config.mcpServers[server])) {
       disabledMatch ??= server;
@@ -492,10 +492,10 @@ export function executeSearch(
     };
   }
 
-  for (const [serverName, metadata] of state.toolMetadata.entries()) {
+  for (const [serverName] of state.toolMetadata.entries()) {
     if (isServerDisabled(state.config.mcpServers[serverName])) continue;
     if (server && serverName !== server) continue;
-    for (const tool of metadata) {
+    for (const tool of getAuthorizedToolMetadata(state, serverName)) {
       if (pattern.test(tool.name) || pattern.test(tool.description)) {
         matches.push({
           server: serverName,
@@ -559,8 +559,8 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
   }
   if (isServerDisabled(definition)) return disabledResult("list", server);
 
-  const metadata = state.toolMetadata.get(server);
-  const toolNames = metadata?.map(m => m.name) ?? [];
+  const metadata = getAuthorizedToolMetadata(state, server);
+  const toolNames = metadata.map(m => m.name);
   const connection = state.manager.getConnection(server);
   const instructions = state.serverInstructions.get(server);
   let instructionsText = "";
@@ -579,7 +579,7 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
         details: { mode: "list", server, tools: [], count: 0, hasInstructions: Boolean(instructions) },
       };
     }
-    if (metadata !== undefined) {
+    if (state.toolMetadata.has(server)) {
       return {
         content: [{ type: "text" as const, text: `Server "${server}" has no cached tools (not connected).${instructionsText}` }],
         details: { mode: "list", server, tools: [], count: 0, cached: true, hasInstructions: Boolean(instructions) },
@@ -595,10 +595,8 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
   let text = `${server} (${toolNames.length} tools${cachedNote}):\n\n`;
 
   const descMap = new Map<string, string>();
-  if (metadata) {
-    for (const m of metadata) {
-      descMap.set(m.name, m.description);
-    }
+  for (const m of metadata) {
+    descMap.set(m.name, m.description);
   }
 
   for (const tool of toolNames) {
@@ -735,6 +733,13 @@ export async function executeCall(
   let toolMeta: ToolMetadata | undefined;
   let autoAuthAttempted = false;
   const prefixMode = state.config.settings?.toolPrefix ?? "server";
+  const notAllowedCallResult = (policyServer: string): ProxyToolResult => {
+    const message = `Tool "${toolName}" is not allowed by the active includeTools/excludeTools policy for server "${policyServer}".`;
+    return {
+      content: [{ type: "text" as const, text: message }],
+      details: { mode: "call", error: "tool_not_allowed", server: policyServer, requestedTool: toolName, message },
+    };
+  };
   const disabledCallResult = (disabledServer: string, metadata?: ToolMetadata): ProxyToolResult => {
     if (!metadata) {
       const message = `Server "${disabledServer}" is disabled. Run /mcp enable ${disabledServer} and /reload to enable it.`;
@@ -760,12 +765,16 @@ export async function executeCall(
     };
   }
   if (serverName) {
-    toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
+    const cachedMatch = findToolByName(state.toolMetadata.get(serverName), toolName);
     if (isServerDisabled(state.config.mcpServers[serverName])) {
-      return disabledCallResult(serverName, toolMeta);
+      return disabledCallResult(serverName, cachedMatch);
     }
+    const authorization = resolveToolRequestAuthorization(state, serverName, toolName, true);
+    if (authorization.status === "denied") return notAllowedCallResult(serverName);
+    toolMeta = authorization.status === "allowed" ? authorization.metadata : undefined;
   } else {
     let disabledMatch: { serverName: string; toolMeta: ToolMetadata } | undefined;
+    let deniedMatch: string | undefined;
     for (const [server, metadata] of state.toolMetadata.entries()) {
       const found = findToolByName(metadata, toolName);
       if (!found) continue;
@@ -773,17 +782,24 @@ export async function executeCall(
         disabledMatch ??= { serverName: server, toolMeta: found };
         continue;
       }
+      if (!isToolMetadataAuthorized(state, server, found)) {
+        deniedMatch ??= server;
+        continue;
+      }
       serverName = server;
       toolMeta = found;
       break;
     }
     if (!toolMeta && disabledMatch) return disabledCallResult(disabledMatch.serverName, disabledMatch.toolMeta);
+    if (!toolMeta && deniedMatch) return notAllowedCallResult(deniedMatch);
   }
 
   if (serverName && !toolMeta) {
     const connected = await lazyConnect(state, serverName, ownedSignal);
     if (connected) {
-      toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
+      const authorization = resolveToolRequestAuthorization(state, serverName, toolName, true);
+      if (authorization.status === "denied") return notAllowedCallResult(serverName);
+      toolMeta = authorization.status === "allowed" ? authorization.metadata : undefined;
     } else {
       const needsAuthConnection = state.manager.getConnection(serverName);
       if (needsAuthConnection?.status === "needs-auth") {
@@ -801,7 +817,9 @@ export async function executeCall(
             clearFailure(state, serverName);
             const connectedAfterAuth = await lazyConnect(state, serverName, ownedSignal);
             if (connectedAfterAuth) {
-              toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
+              const authorization = resolveToolRequestAuthorization(state, serverName, toolName, true);
+              if (authorization.status === "denied") return notAllowedCallResult(serverName);
+              toolMeta = authorization.status === "allowed" ? authorization.metadata : undefined;
               if (!toolMeta) {
                 return {
                   content: [{ type: "text" as const, text: `Tool "${toolName}" not found on "${serverName}" after reconnect.` }],
@@ -843,6 +861,8 @@ export async function executeCall(
       .sort((a, b) => b.prefix.length - a.prefix.length);
 
     for (const { name: configuredServer } of candidates) {
+      const preConnectAuthorization = resolveToolRequestAuthorization(state, configuredServer, toolName);
+      if (preConnectAuthorization.status === "denied") return notAllowedCallResult(configuredServer);
       const existingConnection = state.manager.getConnection(configuredServer);
       const failedAgo = getFailureAgeSeconds(state, configuredServer);
       if (failedAgo !== null && existingConnection?.status !== "needs-auth") continue;
@@ -866,7 +886,9 @@ export async function executeCall(
 
       if (!connected) continue;
       if (!prefixMatchedServer) prefixMatchedServer = configuredServer;
-      toolMeta = findToolByName(state.toolMetadata.get(configuredServer), toolName);
+      const authorization = resolveToolRequestAuthorization(state, configuredServer, toolName);
+      if (authorization.status === "denied") return notAllowedCallResult(configuredServer);
+      toolMeta = authorization.status === "allowed" ? authorization.metadata : undefined;
       if (toolMeta) {
         serverName = configuredServer;
         break;
@@ -981,7 +1003,9 @@ export async function executeCall(
       notifyToolMetadataUpdated(state, serverName, "proxy-call-reconnect");
       markKeepAliveAfterConnect(state, serverName);
       updateStatusBar(state);
-      toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
+      const authorization = resolveToolRequestAuthorization(state, serverName, toolName, true);
+      if (authorization.status === "denied") return notAllowedCallResult(serverName);
+      toolMeta = authorization.status === "allowed" ? authorization.metadata : undefined;
       if (!toolMeta) {
         const available = getToolNames(state, serverName);
         const hint = available.length > 0
@@ -1007,6 +1031,7 @@ export async function executeCall(
   if (isServerDisabled(state.config.mcpServers[serverName])) {
     return disabledCallResult(serverName, toolMeta);
   }
+  if (!isToolMetadataAuthorized(state, serverName, toolMeta)) return notAllowedCallResult(serverName);
 
   let uiSession: UiSessionRuntime | null = null;
   const requestOptions = state.manager.getRequestOptions?.(serverName, ownedSignal) ?? (ownedSignal ? { signal: ownedSignal } : undefined);
