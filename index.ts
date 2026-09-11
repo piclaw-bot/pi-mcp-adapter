@@ -17,6 +17,7 @@ import { createMcpDirectToolCallRenderer, renderMcpProxyToolCall, renderMcpToolR
 import { toolErrorOverride } from "./error-signal.ts";
 import { createMcpRuntimeOwner, createOwnedUi, isAbortError, type McpRuntimeOwner } from "./runtime-owner.ts";
 import { publishMcpStatusShutdown } from "./mcp-status.ts";
+import { shouldInitializeMcpOnLoad } from "./lifecycle-options.ts";
 
 export type { McpAdapterOptions } from "./types.ts";
 export {
@@ -55,12 +56,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   let lifecycleGeneration = 0;
 
   async function shutdownState(currentState: McpExtensionState | null, reason: string): Promise<void> {
-    if (!currentState) {
-      publishMcpStatusShutdown(pi.events);
-      return;
-    }
-
-    publishMcpStatusShutdown(currentState.statusEvents);
+    if (!currentState) return;
 
     if (currentState.uiServer) {
       currentState.uiServer.close(reason);
@@ -391,6 +387,10 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       ]);
     } catch (error) {
       console.error(`MCP: session shutdown cleanup failed: ${formatTerminalError(error)}`);
+    } finally {
+      // Publish only after every cleanup path settles so aggregate owner/process
+      // counts reflect the post-shutdown baseline, including unresolved init.
+      publishMcpStatusShutdown(currentState?.statusEvents ?? pi.events);
     }
   });
 
@@ -780,7 +780,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
 
   const initialDirectTools = syncDirectTools(earlyConfig, earlyCache).specs;
   syncProxyTool(earlyConfig, earlyCache, initialDirectTools);
-  startLoadTimeInitialization();
+  if (shouldInitializeMcpOnLoad(options)) startLoadTimeInitialization();
 }
 
 export function createMcpAdapter(options: McpAdapterOptions = {}) {
@@ -789,6 +789,7 @@ export function createMcpAdapter(options: McpAdapterOptions = {}) {
     installMcpAdapter(pi, {
       configPath: options.configPath,
       config: factoryConfig !== undefined ? cloneMcpConfig(factoryConfig) : undefined,
+      initializeOnLoad: options.initializeOnLoad,
     });
   };
 }

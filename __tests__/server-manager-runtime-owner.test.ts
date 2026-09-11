@@ -1,5 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+// Keep this compatibility-branch suite independent of its known Vitest/Zod 4
+// root named-export optimizer defect (see proxy-tool-policy.test.ts).
+vi.mock("zod", async () => {
+  const actual = await vi.importActual<Record<string, unknown>>("zod/v4");
+  return { ...actual, z: actual.z ?? actual.default };
+});
+vi.mock("@earendil-works/pi-ai/compat", () => ({ complete: vi.fn() }));
+vi.mock("../sampling-handler.ts", () => ({ registerSamplingHandler: vi.fn() }));
+
 const mocks = vi.hoisted(() => ({
   clients: [] as any[],
   transports: [] as any[],
@@ -71,6 +80,37 @@ describe("MCP manager owner races", () => {
     expect(manager.getAllConnections().size).toBe(0);
     expect(mocks.clients[0].close).not.toHaveBeenCalled();
     expect(mocks.transports[0].close).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses one stdio connection for concurrent calls and reports its managed process", async () => {
+    const { McpServerManager, getManagedMcpStdioProcessCount } = await import("../server-manager.ts");
+    const baseline = getManagedMcpStdioProcessCount();
+    const connectGate = gate();
+    mocks.connectGate = connectGate;
+    const manager = new McpServerManager("/tmp/session");
+    const definition = { command: "node", args: ["server.js"] };
+
+    const first = manager.connect("demo", definition);
+    const second = manager.connect("demo", definition);
+    await Promise.resolve();
+
+    expect(mocks.clients).toHaveLength(1);
+    expect(mocks.transports).toHaveLength(1);
+    expect(manager.getManagedStdioProcessCount()).toBe(0);
+    expect(getManagedMcpStdioProcessCount()).toBe(baseline);
+
+    connectGate.resolve();
+    expect(await second).toBe(await first);
+    expect(mocks.clients[0].connect).toHaveBeenCalledWith(
+      mocks.transports[0],
+      expect.objectContaining({ prior: { kind: "legacy" } }),
+    );
+    expect(manager.getManagedStdioProcessCount()).toBe(1);
+    expect(getManagedMcpStdioProcessCount()).toBe(baseline + 1);
+
+    await manager.closeAll();
+    expect(manager.getManagedStdioProcessCount()).toBe(0);
+    expect(getManagedMcpStdioProcessCount()).toBe(baseline);
   });
 
   it("close aborts an in-flight connect and prevents late insertion", async () => {

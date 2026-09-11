@@ -34,6 +34,10 @@ export interface McpStatusSnapshot {
   readonly totalResources: number;
   readonly connectedCount: number;
   readonly disabledCount: number;
+  /** Active runtime owners represented by this snapshot (zero or one). */
+  readonly activeOwnerCount: number;
+  /** Connected stdio subprocesses managed by this runtime owner. */
+  readonly managedStdioProcessCount: number;
 }
 
 // Import sources for config
@@ -445,6 +449,12 @@ export interface McpConfig {
 export interface McpAdapterOptions {
   config?: McpConfig;
   configPath?: string;
+  /**
+   * Start eager/keep-alive servers as soon as the extension factory is loaded.
+   * Defaults to true for standalone compatibility. SDK hosts that synchronously
+   * emit `session_start` should set this to false to avoid a superseded owner.
+   */
+  initializeOnLoad?: boolean;
 }
 
 // Alias for clarity

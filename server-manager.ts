@@ -4,6 +4,7 @@ import {
   StreamableHTTPClientTransport,
   SdkHttpError,
   UnauthorizedError,
+  type ConnectOptions,
   type RequestOptions,
   type ReadResourceResult,
   type UrlElicitationRequiredError,
@@ -58,6 +59,12 @@ const MCP_CLIENT_OPTIONS = {
   inputRequired: { autoFulfill: true },
 };
 const abortCleanupPromises = new WeakMap<object, Promise<void>>();
+const managedStdioConnections = new Set<ServerConnection>();
+
+/** Process-wide connected stdio count for sanitized lifecycle diagnostics. */
+export function getManagedMcpStdioProcessCount(): number {
+  return managedStdioConnections.size;
+}
 
 type HttpAuthProviderState =
   | { status: "disabled" }
@@ -174,6 +181,15 @@ export class McpServerManager {
     return this.buildRequestOptions(connection?.definition, signal);
   }
 
+  /** Count connected stdio transports owned by this manager without exposing them. */
+  getManagedStdioProcessCount(): number {
+    let count = 0;
+    for (const connection of this.connections.values()) {
+      if (connection.status === "connected" && typeof connection.definition.command === "string") count++;
+    }
+    return count;
+  }
+
   private getResolvedRequestTimeoutMs(definition?: ServerDefinition): number | undefined {
     if (definition?.requestTimeoutMs !== undefined) {
       return normalizeRequestTimeoutMs(definition.requestTimeoutMs);
@@ -233,6 +249,9 @@ export class McpServerManager {
         throw new Error(`MCP connection for ${name} was closed while connecting`);
       }
       this.connections.set(name, connection);
+      if (typeof connection.definition.command === "string" && connection.status === "connected") {
+        managedStdioConnections.add(connection);
+      }
       return connection;
     } finally {
       if (this.connectPromises.get(name) === promise) this.connectPromises.delete(name);
@@ -364,9 +383,15 @@ export class McpServerManager {
 
     throwIfAborted(signal);
     const requestOptions = this.buildRequestOptions(definition, requestSignal);
+    const connectOptions: ConnectOptions | undefined = definition.command
+      ? { ...requestOptions, prior: { kind: "legacy" } }
+      : requestOptions;
 
     try {
-      await this.connectClientWithAbort(client, transport, requestOptions, signal);
+      // Explicit stdio commands are the legacy initialize transport. Supplying
+      // that known verdict prevents the v2 client from spawning a disposable
+      // server/discover probe before opening the real process.
+      await this.connectClientWithAbort(client, transport, connectOptions, signal);
       this.attachAdapterNotificationHandlers(name, client);
 
       const connection: ServerConnection = {
@@ -393,6 +418,7 @@ export class McpServerManager {
       // avoided too: it can fire on benign events (e.g. the optional GET
       // SSE stream failing) that don't mean the connection is closed.
       client.onclose = () => {
+        managedStdioConnections.delete(connection);
         if (this.connections.get(name) === connection) {
           connection.status = "closed";
         }
@@ -460,7 +486,7 @@ export class McpServerManager {
   private async connectClientWithAbort(
     client: Client,
     transport: Transport,
-    requestOptions?: RequestOptions,
+    requestOptions?: ConnectOptions,
     signal?: AbortSignal,
   ): Promise<void> {
     throwIfAborted(signal);
@@ -925,6 +951,7 @@ export class McpServerManager {
   }
 
   private async disposeConnection(connection: ServerConnection): Promise<void> {
+    managedStdioConnections.delete(connection);
     const results = await Promise.allSettled([
       Promise.resolve().then(() => connection.client.close()),
       Promise.resolve().then(() => connection.transport.close()),
