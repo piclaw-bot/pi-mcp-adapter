@@ -1,7 +1,7 @@
 import { getToolUiResourceUri } from "@modelcontextprotocol/ext-apps/app-bridge";
 import type { McpExtensionState } from "./state.ts";
 import type { ToolMetadata, McpTool, McpResource, ServerEntry, ToolPrefix } from "./types.ts";
-import { formatToolName, isToolAllowed } from "./types.ts";
+import { formatToolName, getServerPrefix, isToolAllowed } from "./types.ts";
 import { resourceNameToToolName } from "./resource-tools.ts";
 import { extractToolUiStreamMode } from "./utils.ts";
 
@@ -72,14 +72,82 @@ export function buildToolMetadata(
   return { metadata, failedTools };
 }
 
+export function getAuthorizedToolMetadata(state: McpExtensionState, serverName: string): ToolMetadata[] {
+  const definition = state.config.mcpServers[serverName];
+  if (!definition) return [];
+  const prefix = state.config.settings?.toolPrefix ?? "server";
+  return (state.toolMetadata.get(serverName) ?? []).filter((metadata) =>
+    isToolAllowed(metadata.originalName || metadata.name, serverName, prefix, definition.includeTools, definition.excludeTools)
+  );
+}
+
+export function isToolMetadataAuthorized(state: McpExtensionState, serverName: string, metadata: ToolMetadata): boolean {
+  const definition = state.config.mcpServers[serverName];
+  if (!definition) return false;
+  const prefix = state.config.settings?.toolPrefix ?? "server";
+  return isToolAllowed(metadata.originalName || metadata.name, serverName, prefix, definition.includeTools, definition.excludeTools);
+}
+
+function findMetadataByRequestedName(metadata: ToolMetadata[], toolName: string, allowOriginalName: boolean): ToolMetadata | undefined {
+  const byPublicName = findToolByName(metadata, toolName);
+  if (byPublicName || !allowOriginalName) return byPublicName;
+  const normalized = toolName.replace(/-/g, "_");
+  return metadata.find((item) => (item.originalName || item.name).replace(/-/g, "_") === normalized);
+}
+
+export type ToolRequestAuthorization =
+  | { status: "allowed"; metadata: ToolMetadata }
+  | { status: "denied"; metadata: ToolMetadata }
+  | { status: "unknown" };
+
+/** Resolve a requested raw/public name to the current server inventory, then apply active policy. */
+export function resolveToolRequestAuthorization(
+  state: McpExtensionState,
+  serverName: string,
+  toolName: string,
+  allowOriginalName = false,
+): ToolRequestAuthorization {
+  const definition = state.config.mcpServers[serverName];
+  if (!definition) return { status: "unknown" };
+  const prefix = state.config.settings?.toolPrefix ?? "server";
+  let metadata = findMetadataByRequestedName(state.toolMetadata.get(serverName) ?? [], toolName, allowOriginalName);
+  if (!metadata) {
+    const connection = state.manager.getConnection(serverName);
+    if (connection?.status === "connected") {
+      const unrestricted = buildToolMetadata(
+        connection.tools ?? [],
+        connection.resources ?? [],
+        { ...definition, includeTools: undefined, excludeTools: undefined },
+        serverName,
+        prefix,
+      ).metadata;
+      metadata = findMetadataByRequestedName(unrestricted, toolName, allowOriginalName);
+    }
+  }
+  if (!metadata) return { status: "unknown" };
+  return isToolMetadataAuthorized(state, serverName, metadata)
+    ? { status: "allowed", metadata }
+    : { status: "denied", metadata };
+}
+
+export function findAuthorizedToolByName(
+  state: McpExtensionState,
+  serverName: string,
+  toolName: string,
+  allowOriginalName = false,
+): ToolMetadata | undefined {
+  const authorization = resolveToolRequestAuthorization(state, serverName, toolName, allowOriginalName);
+  return authorization.status === "allowed" ? authorization.metadata : undefined;
+}
+
 export function getToolNames(state: McpExtensionState, serverName: string): string[] {
-  return state.toolMetadata.get(serverName)?.map(m => m.name) ?? [];
+  return getAuthorizedToolMetadata(state, serverName).map(m => m.name);
 }
 
 export function totalToolCount(state: McpExtensionState): number {
   let count = 0;
-  for (const metadata of state.toolMetadata.values()) {
-    count += metadata.length;
+  for (const serverName of state.toolMetadata.keys()) {
+    count += getAuthorizedToolMetadata(state, serverName).length;
   }
   return count;
 }

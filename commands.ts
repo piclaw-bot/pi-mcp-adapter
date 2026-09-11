@@ -15,7 +15,7 @@ import {
 } from "./config.ts";
 import { markKeepAliveAfterConnect, notifyToolMetadataUpdated, updateMetadataCache, updateStatusBar, getFailureAgeSeconds, getFailureMessage, clearFailure, recordFailure } from "./init.ts";
 import { loadMetadataCache, reconstructPromptMetadata } from "./metadata-cache.ts";
-import { buildToolMetadata } from "./tool-metadata.ts";
+import { buildToolMetadata, getAuthorizedToolMetadata } from "./tool-metadata.ts";
 import { supportsOAuth, authenticate, removeAuth, type McpOAuthRuntime } from "./mcp-auth-flow.ts";
 import { getAuthForUrl, getAuthStorageOptions } from "./mcp-auth.ts";
 import { loadOnboardingState, markSetupCompleted as persistSetupCompleted, markSharedConfigHintShown } from "./onboarding-state.ts";
@@ -35,7 +35,7 @@ export async function showStatus(state: McpExtensionState, ctx: ExtensionContext
     }
     const connection = state.manager.getConnection(name);
     const metadata = state.toolMetadata.get(name);
-    const toolCount = metadata?.length ?? 0;
+    const toolCount = getAuthorizedToolMetadata(state, name).length;
     const failedAgo = getFailureAgeSeconds(state, name);
     let status = "not connected";
     let statusIcon = "○";
@@ -108,9 +108,9 @@ export async function showPrompts(state: McpExtensionState, ctx: ExtensionContex
 export async function showTools(state: McpExtensionState, ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return;
 
-  const allTools = [...state.toolMetadata.entries()]
-    .filter(([serverName]) => !isServerDisabled(state.config.mcpServers[serverName]))
-    .flatMap(([, metadata]) => metadata.map(m => m.name));
+  const allTools = [...state.toolMetadata.keys()]
+    .filter((serverName) => !isServerDisabled(state.config.mcpServers[serverName]))
+    .flatMap((serverName) => getAuthorizedToolMetadata(state, serverName).map(m => m.name));
 
   if (allTools.length === 0) {
     ctx.ui.notify("No MCP tools available", "info");

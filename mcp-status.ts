@@ -1,4 +1,5 @@
 import type { McpExtensionState } from "./state.ts";
+import { getAuthorizedToolMetadata } from "./tool-metadata.ts";
 import {
   MCP_STATUS_EVENT,
   MCP_STATUS_SNAPSHOT_VERSION,
@@ -32,11 +33,18 @@ export function createMcpStatusSnapshot(state: McpExtensionState): McpStatusSnap
     const definition = state.config.mcpServers[name];
     const disabled = definition?.disabled === true;
     const connection = disabled ? undefined : state.manager.getConnection(name);
-    const metadata = disabled ? undefined : state.toolMetadata.get(name);
-    const toolCount = metadata?.length ?? (connection?.status === "connected" ? connection.tools.length : 0);
+    const metadataPresent = !disabled && state.toolMetadata.has(name);
+    const metadata = disabled ? [] : getAuthorizedToolMetadata(state, name);
+    const toolCount = metadata.length;
+    const authorizedResourceCount = metadata.filter((tool) => Boolean(tool.resourceUri)).length;
+    const rawResourceToolCount = (state.toolMetadata.get(name) ?? []).filter((tool) => Boolean(tool.resourceUri)).length;
+    const fallbackResourceCount = state.resourceCounts?.get(name)
+      ?? (connection?.status === "connected" ? connection.resources?.length : undefined);
     const resourceCount = disabled
       ? undefined
-      : state.resourceCounts?.get(name) ?? (connection?.status === "connected" ? connection.resources.length : undefined);
+      : rawResourceToolCount > 0
+        ? authorizedResourceCount
+        : fallbackResourceCount;
     const failedAgoSeconds = disabled ? undefined : getActiveFailureAgeSeconds(state, name);
 
     let status: McpServerStatusSnapshot["status"] = "not-connected";
@@ -50,7 +58,7 @@ export function createMcpStatusSnapshot(state: McpExtensionState): McpStatusSnap
       status = "needs-auth";
     } else if (failedAgoSeconds !== undefined) {
       status = "failed";
-    } else if (metadata !== undefined) {
+    } else if (metadataPresent) {
       status = "cached";
     }
 
