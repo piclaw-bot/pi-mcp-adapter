@@ -213,6 +213,7 @@ export class McpServerManager {
   private defaultRequestTimeoutMs: number | undefined;
   private runtimeSignal: AbortSignal | undefined;
   private closePromises = new Map<string, Promise<void>>();
+  private readonly cleanupFailures: unknown[] = [];
   private closeGenerations = new Map<string, number>();
   private connectAttempts = new Map<string, AbortController>();
   private traceSettings: McpTraceSettings | undefined;
@@ -1555,7 +1556,10 @@ export class McpServerManager {
     connection.status = "closed";
     this.connections.delete(name);
     this.acceptedUrlElicitations.delete(name);
-    const closing = this.disposeConnection(connection).finally(() => {
+    const closing = this.disposeConnection(connection).catch(error => {
+      this.cleanupFailures.push(error);
+      throw error;
+    }).finally(() => {
       if (this.closePromises.get(name) === closing) this.closePromises.delete(name);
     });
     this.closePromises.set(name, closing);
@@ -1581,8 +1585,9 @@ export class McpServerManager {
     }
 
     const pendingConnects = [...this.connectPromises.values()];
+    const pendingCloses = [...this.closePromises.values()];
     const currentNames = [...this.connections.keys()];
-    const pendingResults = await Promise.allSettled(pendingConnects);
+    const pendingResults = await Promise.allSettled([...pendingConnects, ...pendingCloses]);
     const results = await Promise.allSettled(currentNames.map(name => this.close(name)));
 
     // A connect that resolved during the first close snapshot is still fenced;
@@ -1592,6 +1597,7 @@ export class McpServerManager {
     const failures = [...pendingResults, ...results, ...lateResults]
       .flatMap(result => result.status === "rejected" ? [result.reason] : [])
       .filter(error => this.containsCleanupFailure(error));
+    failures.push(...this.cleanupFailures);
     this.uiStreamListeners.clear();
     this.resourceUpdatedListeners.clear();
     this.acceptedUrlElicitations.clear();

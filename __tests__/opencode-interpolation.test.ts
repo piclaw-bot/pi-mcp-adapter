@@ -51,7 +51,7 @@ describe("OpenCode environment interpolation", () => {
   it("resolves command secrets without executing cache-facing expressions", () => {
     process.env.MCP_TEST_VALUE = "interpolated";
     process.env.MCP_TEST_BEARER_TOKEN_ENV = "!literal-token";
-    const expression = `!node -e "process.stdout.write('  resolved  ')"`;
+    const expression = `!${JSON.stringify(process.execPath)} -e "process.stdout.write('  resolved  ')"`;
 
     expect(resolveCommandSecret(expression, "test secret")).toBe("resolved");
     expect(resolveCommandSecret("!!literal-{env:MCP_TEST_VALUE}", "test secret")).toBe("!literal-interpolated");
@@ -59,10 +59,10 @@ describe("OpenCode environment interpolation", () => {
     expect(resolveBearerToken({ bearerTokenEnv: "MCP_TEST_BEARER_TOKEN_ENV" })).toBe("!literal-token");
 
     expect(() => resolveCommandSecret(
-      `!node -e "process.stderr.write('private-stderr'); process.exit(7)"`,
+      `!${JSON.stringify(process.execPath)} -e "process.stderr.write('private-stderr'); process.exit(7)"`,
       "test secret",
     )).toThrow(/^Failed to resolve test secret: command exited with code 7$/);
-    expect(() => resolveCommandSecret(`!node -e ""`, "test secret"))
+    expect(() => resolveCommandSecret(`!${JSON.stringify(process.execPath)} -e "void 0"`, "test secret"))
       .toThrow(/^Failed to resolve test secret: command returned empty output$/);
   });
 

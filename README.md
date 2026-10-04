@@ -206,6 +206,27 @@ const extension = createMcpAdapter({
 // Register `extension` with the host SDK.
 ```
 
+Hosts that must acknowledge transport shutdown before replacing an engine can
+use the public, per-installation lifecycle handle:
+
+```ts
+let lifecycle: import("pi-mcp-adapter").McpAdapterLifecycle;
+const extension = createMcpAdapter({
+  initializeOnLoad: false,
+  onLifecycle: handle => { lifecycle = handle; },
+});
+// After the host aborts its active agent turns:
+await lifecycle.shutdown("selected MCP engine changed");
+```
+
+`shutdown` permanently fences that installation and waits for admitted
+initialisation, transports, OAuth and cleanup. Concurrent/reentrant callers
+share one settlement. Cleanup failures reject and remain observable; the host
+must keep replacement admission blocked after rejection or timeout. A later
+factory installation gets a new handle. See [the lifecycle contract and Bun
+qualification](HOST-SHUTDOWN-ACK.md). This API does not qualify another MCP
+engine's capabilities or credential policy.
+
 The package ships TypeScript source for Pi's source-loader and SDK integrations. Use a TypeScript-capable loader/toolchain (for example `node --import tsx`) when importing the package from a standalone Node process; raw Node ESM does not execute the `.ts` entry directly.
 
 A supplied `config` is a complete, isolated snapshot. It is not merged with files, imports, global config, project config, or `--mcp-config`, and it is never mutated.

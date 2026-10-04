@@ -1335,7 +1335,7 @@ describe("mcpAdapter session lifecycle", () => {
     expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("in-memory"), "info");
   });
 
-  it("starts a replacement init immediately and shuts down stale init results", async () => {
+  it("waits for admitted stale initialization cleanup before replacement", async () => {
     const first = createDeferred<any>();
     const second = createDeferred<any>();
     mocks.initializeMcp
@@ -1354,7 +1354,13 @@ describe("mcpAdapter session lifecycle", () => {
     expect(mocks.shutdownOAuth).not.toHaveBeenCalled();
     const firstRuntime = mocks.createOAuthRuntime.mock.results[0].value;
 
-    await sessionStart?.({}, {});
+    const replacement = sessionStart?.({}, {});
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mocks.initializeMcp).toHaveBeenCalledTimes(1);
+    expect(firstRuntime.signal.aborted).toBe(true);
+    const staleState = createState();
+    first.resolve(staleState);
+    await replacement;
     expect(mocks.initializeMcp).toHaveBeenCalledTimes(2);
     expect(mocks.shutdownOAuth).toHaveBeenCalledTimes(1);
     expect(mocks.shutdownOAuth).toHaveBeenCalledWith(firstRuntime);
@@ -1366,11 +1372,6 @@ describe("mcpAdapter session lifecycle", () => {
 
     expect(mocks.updateStatusBar).toHaveBeenCalledWith(activeState);
     expect(activeState.lifecycle.gracefulShutdown).not.toHaveBeenCalled();
-
-    const staleState = createState();
-    first.resolve(staleState);
-    await Promise.resolve();
-    await Promise.resolve();
 
     expect(mocks.updateStatusBar).not.toHaveBeenCalledWith(staleState);
     expect(mocks.flushMetadataCache).toHaveBeenCalledWith(staleState);
@@ -1487,9 +1488,13 @@ describe("mcpAdapter session lifecycle", () => {
     const loadRuntime = mocks.createOAuthRuntime.mock.results[0].value;
 
     const sessionStart = handlers.get("session_start");
-    await sessionStart?.({}, { hasUI: false });
-    expect(mocks.initializeMcp).toHaveBeenCalledTimes(2);
+    const replacement = sessionStart?.({}, { hasUI: false });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mocks.initializeMcp).toHaveBeenCalledTimes(1);
     expect(loadRuntime.signal.aborted).toBe(true);
+    const staleState = createState(); loadInit.resolve(staleState);
+    await replacement;
+    expect(mocks.initializeMcp).toHaveBeenCalledTimes(2);
     expect(mocks.shutdownOAuth).toHaveBeenCalledWith(loadRuntime);
 
     const sessionState = createState();
@@ -1498,10 +1503,6 @@ describe("mcpAdapter session lifecycle", () => {
     await Promise.resolve();
     expect(mocks.updateStatusBar).toHaveBeenCalledWith(sessionState);
 
-    const staleState = createState();
-    loadInit.resolve(staleState);
-    await Promise.resolve();
-    await Promise.resolve();
     expect(mocks.updateStatusBar).not.toHaveBeenCalledWith(staleState);
     expect(mocks.flushMetadataCache).toHaveBeenCalledWith(staleState);
     expect(staleState.lifecycle.gracefulShutdown).toHaveBeenCalledTimes(1);
@@ -1547,12 +1548,13 @@ describe("mcpAdapter session lifecycle", () => {
     const loadRuntime = mocks.createOAuthRuntime.mock.results[0].value;
 
     const sessionShutdown = handlers.get("session_shutdown");
-    await sessionShutdown?.();
+    const pendingShutdown = sessionShutdown?.();
     expect(loadRuntime.signal.aborted).toBe(true);
     expect(mocks.shutdownOAuth).toHaveBeenCalledWith(loadRuntime);
 
     const staleState = createState();
     loadInit.resolve(staleState);
+    await pendingShutdown;
     await Promise.resolve();
     await Promise.resolve();
 
@@ -1664,10 +1666,11 @@ describe("mcpAdapter session lifecycle", () => {
     const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
     const resultPromise = proxyTool.execute("call-1", { search: "demo" }, undefined, undefined, { hasUI: false });
 
-    await handlers.get("session_shutdown")?.();
+    const assertion = expect(resultPromise).rejects.toThrow("network down");
+    const shutdown = handlers.get("session_shutdown")?.();
     initializing.reject(new Error("network down"));
-
-    await expect(resultPromise).rejects.toThrow("network down");
+    await shutdown;
+    await assertion;
     expect(mocks.executeSearch).not.toHaveBeenCalled();
   });
 
@@ -2020,6 +2023,66 @@ describe("mcpAdapter session lifecycle", () => {
     } finally {
       consoleError.mockRestore();
     }
+  });
+
+  it("public host shutdown awaits delayed initialization cleanup and fences reuse", async () => {
+    const state = createState();
+    const initialization = createDeferred<typeof state>();
+    const cleanup = createDeferred<void>();
+    state.lifecycle.gracefulShutdown.mockReturnValue(cleanup.promise);
+    mocks.initializeMcp.mockReturnValue(initialization.promise);
+    const { createMcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    let lifecycle!: import("../types.ts").McpAdapterLifecycle;
+    createMcpAdapter({ initializeOnLoad: false, onLifecycle: value => { lifecycle = value; } })(api);
+    await handlers.get("session_start")?.({}, {});
+    const first = lifecycle.shutdown("engine switch");
+    expect(lifecycle.shutdown()).toBe(first);
+    expect(mocks.createOAuthRuntime.mock.results[0].value.signal.aborted).toBe(true);
+    let settled = false; void first.then(() => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve)); expect(settled).toBe(false);
+    initialization.resolve(state);
+    await new Promise(resolve => setImmediate(resolve)); expect(settled).toBe(false);
+    cleanup.resolve(); await first; expect(settled).toBe(true);
+    expect(state.lifecycle.gracefulShutdown).toHaveBeenCalledTimes(1);
+    await expect(handlers.get("session_start")?.({}, {})).rejects.toThrow("shut down by its host");
+    expect(mocks.initializeMcp).toHaveBeenCalledTimes(1);
+  });
+
+  it("public host shutdown retains a suppressed session cleanup rejection", async () => {
+    const state = createState();
+    state.lifecycle.gracefulShutdown.mockRejectedValue(new Error("close failed"));
+    mocks.initializeMcp.mockResolvedValue(state);
+    const { createMcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    let lifecycle!: import("../types.ts").McpAdapterLifecycle;
+    createMcpAdapter({ initializeOnLoad: false, onLifecycle: value => { lifecycle = value; } })(api);
+    await handlers.get("session_start")?.({}, {});
+    await new Promise(resolve => setImmediate(resolve));
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await handlers.get("session_shutdown")?.({}, {});
+      await expect(lifecycle.shutdown()).rejects.toThrow("host shutdown cleanup failed");
+      await expect(lifecycle.shutdown()).rejects.toThrow("host shutdown cleanup failed");
+    } finally { consoleError.mockRestore(); }
+  });
+
+  it("public host shutdown awaits every cleanup despite an early rejection", async () => {
+    const state = createState();
+    const cleanup = createDeferred<void>();
+    state.lifecycle.gracefulShutdown.mockReturnValue(cleanup.promise);
+    mocks.initializeMcp.mockResolvedValue(state);
+    const { createMcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    let lifecycle!: import("../types.ts").McpAdapterLifecycle;
+    createMcpAdapter({ initializeOnLoad: false, onLifecycle: value => { lifecycle = value; } })(api);
+    await handlers.get("session_start")?.({}, {});
+    await new Promise(resolve => setImmediate(resolve));
+    mocks.shutdownOAuth.mockRejectedValue(new Error("oauth failed"));
+    const pending = lifecycle.shutdown();
+    let settled = false; void pending.catch(() => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve)); expect(settled).toBe(false);
+    cleanup.resolve(); await expect(pending).rejects.toThrow("host shutdown cleanup failed");
   });
 
   it("registers a tool_result handler that re-flags returned MCP tool failures (and leaves other results alone)", async () => {

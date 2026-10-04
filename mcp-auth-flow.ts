@@ -91,6 +91,9 @@ type RuntimeState = {
   pendingAuthStates: Map<string, string>
   pendingAuthCleanupTimers: Map<string, ReturnType<typeof setTimeout>>
   pendingAuthentications: Map<string, Promise<AuthStatus>>
+  shutdownPromise?: Promise<void>
+  operations: Set<Promise<unknown>>
+  cleanupFailures: unknown[]
 }
 
 const runtimeStates = new WeakMap<McpOAuthRuntime, RuntimeState>()
@@ -106,6 +109,8 @@ export function createOAuthRuntime(signal?: AbortSignal): McpOAuthRuntime {
     pendingAuthStates: new Map(),
     pendingAuthCleanupTimers: new Map(),
     pendingAuthentications: new Map(),
+    operations: new Set(),
+    cleanupFailures: [],
   })
   activeRuntimes.add(runtime)
   return runtime
@@ -129,6 +134,31 @@ function getRuntimeState(runtime: McpOAuthRuntime): RuntimeState {
   const state = runtimeStates.get(runtime)
   if (!state) throw new Error("Unknown OAuth runtime")
   return state
+}
+
+function trackOAuthOperation<T>(runtime: McpOAuthRuntime, operation: () => Promise<T>, checkAdmission = true): Promise<T> {
+  const state = getRuntimeState(runtime)
+  if (checkAdmission) runtime.signal.throwIfAborted()
+  const task = Promise.resolve().then(() => {
+    if (checkAdmission) runtime.signal.throwIfAborted()
+    return operation()
+  })
+  state.operations.add(task)
+  void task.then(() => state.operations.delete(task), error => {
+    state.operations.delete(task)
+  })
+  return task
+}
+
+function trackOAuthCleanup<T>(runtime: McpOAuthRuntime, operation: () => Promise<T>): Promise<T> {
+  const state = getRuntimeState(runtime)
+  const task = trackOAuthOperation(runtime, operation, false)
+  void task.catch(error => { state.cleanupFailures.push(error) })
+  return task
+}
+
+function trackedSdkAuth(runtime: McpOAuthRuntime, ...args: Parameters<typeof runSdkAuth>): ReturnType<typeof runSdkAuth> {
+  return trackOAuthOperation(runtime, () => runSdkAuth(...args))
 }
 
 function getPendingAuthKey(serverName: string, options: AuthStorageOptions): string {
@@ -366,7 +396,7 @@ function parseOAuthRedirectUri(redirectUri: string): OAuthRedirectTarget {
  * Start OAuth authentication flow for a server.
  * Returns the authorization URL when browser authorization is required.
  */
-export async function startAuth(
+async function startAuthOwned(
   serverName: string,
   serverUrl: string,
   definition?: ServerEntry,
@@ -398,7 +428,7 @@ export async function startAuth(
     try {
       const discovery = applyOAuthConfig(await probeAuthDiscovery(serverUrl, definition, signal, runtimeEnv), config)
       throwIfAborted(signal)
-      const result = await abortable(runSdkAuth(authProvider, { serverUrl, ...discovery }), signal)
+      const result = await abortable(trackedSdkAuth(runtime, authProvider, { serverUrl, ...discovery }), signal)
       throwIfAborted(signal)
       if (result !== "AUTHORIZED") {
         throw new UnauthorizedError("Failed to authorize")
@@ -432,7 +462,7 @@ export async function startAuth(
     } catch (error) {
       releaseCallbackServer(oauthState)
       try {
-        await cleanupAndReleaseCallbackServerIfIdle(() => clearOAuthState(serverName, authStorageOptions))
+        await cleanupAndReleaseCallbackServerIfIdle(runtime, () => clearOAuthState(serverName, authStorageOptions))
       } catch (cleanupError) {
         throw new AggregateError([error, cleanupError], "OAuth startup cleanup failed")
       }
@@ -469,7 +499,7 @@ export async function startAuth(
 
     const discovery = applyOAuthConfig(await probeAuthDiscovery(serverUrl, definition, signal, runtimeEnv), config)
     throwIfAborted(signal)
-    const result = await abortable(runSdkAuth(authProvider, { serverUrl, ...discovery }), signal)
+    const result = await abortable(trackedSdkAuth(runtime, authProvider, { serverUrl, ...discovery }), signal)
     throwIfAborted(signal)
     if (result === "AUTHORIZED") {
       authProvider.deactivate()
@@ -533,7 +563,7 @@ async function setPendingAuth(
   state.pendingAuthCleanupTimers.set(key, cleanupTimer)
 }
 
-async function clearPendingAuth(
+async function clearPendingAuthOwned(
   runtime: McpOAuthRuntime,
   serverName: string,
   oauthState?: string,
@@ -567,6 +597,10 @@ async function clearPendingAuth(
   }
 }
 
+function clearPendingAuth(...args: Parameters<typeof clearPendingAuthOwned>): ReturnType<typeof clearPendingAuthOwned> {
+  return trackOAuthCleanup(args[0], () => clearPendingAuthOwned(...args))
+}
+
 async function clearPendingAuthAndReleaseIfIdle(
   runtime: McpOAuthRuntime,
   serverName: string,
@@ -574,12 +608,16 @@ async function clearPendingAuthAndReleaseIfIdle(
   fallbackStorageOptions: AuthStorageOptions = {},
   reason?: Error,
 ): Promise<void> {
-  await cleanupAndReleaseCallbackServerIfIdle(
+  await cleanupAndReleaseCallbackServerIfIdle(runtime,
     () => clearPendingAuth(runtime, serverName, oauthState, fallbackStorageOptions, reason),
   )
 }
 
-async function cleanupAndReleaseCallbackServerIfIdle(cleanup: () => void | Promise<void>): Promise<void> {
+function cleanupAndReleaseCallbackServerIfIdle(runtime: McpOAuthRuntime, cleanup: () => void | Promise<void>): Promise<void> {
+  return trackOAuthCleanup(runtime, () => cleanupAndReleaseCallbackServerIfIdleOwned(cleanup))
+}
+
+async function cleanupAndReleaseCallbackServerIfIdleOwned(cleanup: () => void | Promise<void>): Promise<void> {
   let cleanupFailure: { error: unknown } | undefined
   try {
     await cleanup()
@@ -736,7 +774,7 @@ export async function waitForAuthorizationResponse(
 /**
  * Complete OAuth authentication from manual user input.
  */
-export async function completeAuthFromInput(
+async function completeAuthFromInputOwned(
   serverName: string,
   input: string,
   options: AuthenticateOptions = {},
@@ -760,7 +798,7 @@ export async function completeAuthFromInput(
 /**
  * Complete OAuth authentication with the authorization code.
  */
-export async function completeAuth(
+async function completeAuthOwned(
   serverName: string,
   authorizationCode: string | AuthorizationCodeInput,
   options: AuthenticateOptions = {},
@@ -787,6 +825,7 @@ export async function completeAuth(
   let caughtError: unknown
   try {
     const discoveryState = await pendingAuth.authProvider.discoveryState()
+    throwIfAborted(signal)
     const metadata = discoveryState?.authorizationServerMetadata
     const expectedIssuer = metadata?.issuer ?? discoveryState?.authorizationServerUrl
     const requiresIssuer = (metadata as { authorization_response_iss_parameter_supported?: unknown } | undefined)
@@ -802,7 +841,7 @@ export async function completeAuth(
       throw new Error(`The OAuth authorization response issuer does not match the discovered issuer for ${serverName}.`)
     }
 
-    const result = await abortable(runSdkAuth(pendingAuth.authProvider, {
+    const result = await abortable(trackedSdkAuth(runtime, pendingAuth.authProvider, {
       serverUrl: pendingAuth.serverUrl,
       authorizationCode: code,
       ...(iss !== undefined ? { iss } : {}),
@@ -838,7 +877,7 @@ export async function completeAuth(
  * @param definition - The server definition (optional)
  * @returns The final auth status
  */
-export async function authenticate(
+async function authenticateOwned(
   serverName: string,
   serverUrl: string,
   definition?: ServerEntry,
@@ -958,7 +997,7 @@ export async function authenticate(
  * @param serverUrl - The URL of the MCP server
  * @returns The valid tokens or null if not authenticated
  */
-export async function getValidToken(
+async function getValidTokenOwned(
   serverName: string,
   serverUrl: string,
   options: AuthenticateOptions = {},
@@ -1001,7 +1040,7 @@ export async function getValidToken(
           config,
         )
         throwIfAborted(signal)
-        const result = await abortable(runSdkAuth(authProvider, {
+        const result = await abortable(trackedSdkAuth(runtime, authProvider, {
           serverUrl,
           ...discovery,
           ...(options.skipIssuerMetadataValidation === true ? { skipIssuerMetadataValidation: true } : {}),
@@ -1033,7 +1072,7 @@ export async function getValidToken(
  * @param serverName - The name of the MCP server
  * @returns The current auth status
  */
-export async function getAuthStatus(serverName: string, options: AuthenticateOptions = {}): Promise<AuthStatus> {
+async function getAuthStatusOwned(serverName: string, options: AuthenticateOptions = {}): Promise<AuthStatus> {
   getRuntime(options)
   const authStorageOptions = options.authStorageOptions ?? {}
   const hasTokens = await hasStoredTokens(serverName, authStorageOptions)
@@ -1048,7 +1087,7 @@ export async function getAuthStatus(serverName: string, options: AuthenticateOpt
  * 
  * @param serverName - The name of the MCP server
  */
-export async function removeAuth(serverName: string, options: AuthenticateOptions = {}): Promise<void> {
+async function removeAuthOwned(serverName: string, options: AuthenticateOptions = {}): Promise<void> {
   const runtime = getRuntime(options)
   const signal = combineAbortSignals(runtime.signal, options.signal)
   throwIfAborted(signal)
@@ -1111,19 +1150,65 @@ export async function initializeOAuth(
  * Shutdown one OAuth runtime. The callback server remains process-shared while
  * another runtime has pending/reserved callback state or is still active.
  */
-export async function shutdownOAuth(runtime: McpOAuthRuntime = legacyRuntime): Promise<void> {
+export function shutdownOAuth(runtime: McpOAuthRuntime = legacyRuntime): Promise<void> {
   const state = getRuntimeState(runtime)
-  if (state.controller.signal.aborted) return
+  if (state.shutdownPromise) return state.shutdownPromise
+  let resolveShutdown!: () => void, rejectShutdown!: (error: unknown) => void
+  state.shutdownPromise = new Promise<void>((resolve, reject) => { resolveShutdown = resolve; rejectShutdown = reject })
   state.generation += 1
+  const pendingAuthentications = [...state.pendingAuthentications.values()]
   state.controller.abort(new Error("OAuth runtime stopped"))
-  for (const callbackState of Array.from(state.pendingAuthStates.values())) cancelPendingCallback(callbackState)
-  for (const pendingAuth of Array.from(state.pendingAuths.values())) {
-    await clearPendingAuth(runtime, pendingAuth.serverName, undefined, pendingAuth.authStorageOptions)
-  }
-  state.pendingAuthentications.clear()
-  activeRuntimes.delete(runtime)
+  void (async () => {
+    for (const callbackState of Array.from(state.pendingAuthStates.values())) cancelPendingCallback(callbackState)
+    const results = await Promise.allSettled(Array.from(state.pendingAuths.values()).map(pendingAuth =>
+      clearPendingAuth(runtime, pendingAuth.serverName, undefined, pendingAuth.authStorageOptions)))
+    // Cancellation results are auth outcomes, not cleanup failures, but all
+    // admitted auth work must settle before the shutdown acknowledgement.
+    await Promise.allSettled(pendingAuthentications)
+    while (state.operations.size) await Promise.allSettled([...state.operations])
+    state.pendingAuthentications.clear()
+    activeRuntimes.delete(runtime)
+    if (activeRuntimes.size === 0) {
+      try { await stopCallbackServer() } catch (error) { results.push({ status: "rejected", reason: error }) }
+    }
+    const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : [])
+    failures.push(...state.cleanupFailures)
+    if (failures.length) throw new AggregateError(failures, "MCP OAuth cleanup failed")
+  })().then(resolveShutdown, rejectShutdown)
+  return state.shutdownPromise
+}
 
-  if (activeRuntimes.size === 0) {
-    await stopCallbackServer()
-  }
+export async function startAuth(...args: Parameters<typeof startAuthOwned>): ReturnType<typeof startAuthOwned> {
+  const runtime = getRuntime(args[3] ?? {})
+  return trackOAuthOperation(runtime, () => startAuthOwned(...args))
+}
+
+export async function completeAuthFromInput(...args: Parameters<typeof completeAuthFromInputOwned>): ReturnType<typeof completeAuthFromInputOwned> {
+  const runtime = getRuntime(args[2] ?? {})
+  return trackOAuthOperation(runtime, () => completeAuthFromInputOwned(...args))
+}
+
+export async function completeAuth(...args: Parameters<typeof completeAuthOwned>): ReturnType<typeof completeAuthOwned> {
+  const runtime = getRuntime(args[2] ?? {})
+  return trackOAuthOperation(runtime, () => completeAuthOwned(...args))
+}
+
+export async function authenticate(...args: Parameters<typeof authenticateOwned>): ReturnType<typeof authenticateOwned> {
+  const runtime = getRuntime(args[3] ?? {})
+  return trackOAuthOperation(runtime, () => authenticateOwned(...args))
+}
+
+export async function getValidToken(...args: Parameters<typeof getValidTokenOwned>): ReturnType<typeof getValidTokenOwned> {
+  const runtime = getRuntime(args[2] ?? {})
+  return trackOAuthOperation(runtime, () => getValidTokenOwned(...args))
+}
+
+export async function getAuthStatus(...args: Parameters<typeof getAuthStatusOwned>): ReturnType<typeof getAuthStatusOwned> {
+  const runtime = getRuntime(args[1] ?? {})
+  return trackOAuthOperation(runtime, () => getAuthStatusOwned(...args))
+}
+
+export async function removeAuth(...args: Parameters<typeof removeAuthOwned>): ReturnType<typeof removeAuthOwned> {
+  const runtime = getRuntime(args[1] ?? {})
+  return trackOAuthOperation(runtime, () => removeAuthOwned(...args))
 }
