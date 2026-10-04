@@ -620,8 +620,15 @@ export interface McpConfig {
   settings?: McpSettings;
 }
 
+export interface McpAdapterLifecycle {
+  /** Permanently fence this installation and await all owned cleanup; failures reject. */
+  shutdown(reason?: string): Promise<void>;
+}
+
 export interface McpAdapterOptions {
   config?: McpConfig;
+  /** Receive one public lifecycle handle per installed extension factory. */
+  onLifecycle?: (lifecycle: McpAdapterLifecycle) => void;
   /** Disable load-time eager startup when the host synchronously owns session_start. Defaults to true. */
   initializeOnLoad?: boolean;
   /** Complete environment visible to one eligible server connection attempt. */

@@ -18,6 +18,40 @@ describe("MCP runtime ownership", () => {
     consoleError.mockRestore();
   });
 
+  it("abort-listener reentrancy shares the same rejecting cleanup settlement", async () => {
+    const owner = createMcpRuntimeOwner();
+    const cleanup = vi.fn(() => { throw Error("synthetic cleanup rejection"); });
+    owner.addCleanup(cleanup);
+    let nested!: Promise<void>;
+    owner.signal.addEventListener("abort", () => { nested = owner.stop("reentrant"); });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const outer = owner.stop();
+      expect(nested).toBe(outer);
+      await expect(outer).rejects.toThrow("cleanup failed");
+      await expect(nested).rejects.toThrow("cleanup failed");
+      expect(cleanup).toHaveBeenCalledTimes(1);
+    } finally { consoleError.mockRestore(); }
+  });
+
+  it("awaits late cleanup and retains its failure after stop has settled", async () => {
+    const owner = createMcpRuntimeOwner();
+    await owner.stop("reload");
+    let release!: () => void;
+    const deferred = new Promise<void>(resolve => { release = resolve; });
+    owner.addCleanup(() => deferred);
+    let settled = false;
+    const cleanup = owner.awaitCleanup().then(() => { settled = true; });
+    await Promise.resolve(); expect(settled).toBe(false);
+    release(); await cleanup; expect(settled).toBe(true);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      owner.addCleanup(() => { throw Error("late failure"); });
+      await expect(owner.awaitCleanup()).rejects.toThrow("MCP runtime cleanup failed");
+      await expect(owner.awaitCleanup()).rejects.toThrow("MCP runtime cleanup failed");
+    } finally { consoleError.mockRestore(); }
+  });
+
   it("does not invoke nested UI methods after the owner stops", async () => {
     const owner = createMcpRuntimeOwner();
     const ui = { notify: vi.fn(), theme: { fg: vi.fn((_color: string, text: string) => text) } } as any;

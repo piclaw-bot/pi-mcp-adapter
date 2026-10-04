@@ -24,7 +24,7 @@ import { cleanupMaterializedBinaryResources } from "./tool-registrar.ts";
 import { acquireMcpOutputArtifactOwner } from "./mcp-output-guard.ts";
 import { syncNamespaceProxyTools } from "./namespace-tools.ts";
 
-export type { McpAdapterOptions } from "./types.ts";
+export type { McpAdapterLifecycle, McpAdapterOptions } from "./types.ts";
 export type { ServerEntry } from "./types.ts";
 export {
   namespaceProxyName,
@@ -140,6 +140,63 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   let currentOAuthRuntime: McpOAuthRuntime | null = null;
   let lifecycleGeneration = 0;
   let retainedInitFailure: string | null = null;
+  let hostStopped = false;
+  let hostShutdownPromise: Promise<void> | undefined;
+  const ownedRuntimes = new Map<McpRuntimeOwner, McpOAuthRuntime>();
+  const initializationTails = new Map<McpRuntimeOwner, Promise<void>>();
+  const retirementTasks = new Map<McpRuntimeOwner, Promise<void>>();
+  const shutdownFailures: unknown[] = [];
+
+  function newOwnedRuntime(): { owner: McpRuntimeOwner; oauthRuntime: McpOAuthRuntime } {
+    const owner = createMcpRuntimeOwner();
+    const oauthRuntime = createOAuthRuntime(owner.signal);
+    ownedRuntimes.set(owner, oauthRuntime);
+    return { owner, oauthRuntime };
+  }
+
+  function retireOwnedRuntime(owner: McpRuntimeOwner, oauthRuntime: McpOAuthRuntime, reason: string): Promise<void> {
+    const pending = retirementTasks.get(owner);
+    if (pending) return pending;
+    let resolveRetirement!: () => void, rejectRetirement!: (error: unknown) => void;
+    const task = new Promise<void>((resolve, reject) => { resolveRetirement = resolve; rejectRetirement = reject; });
+    retirementTasks.set(owner, task);
+    const cleanup = [owner.stop(reason), shutdownOAuth(oauthRuntime)];
+    void (async () => {
+      const stopped = await Promise.allSettled(cleanup);
+      await initializationTails.get(owner);
+      const drained = await Promise.allSettled([owner.awaitCleanup()]);
+      const failures = [...stopped, ...drained].flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length) throw new AggregateError(failures, "MCP owned runtime cleanup failed");
+      ownedRuntimes.delete(owner);
+      retirementTasks.delete(owner);
+    })().then(resolveRetirement, rejectRetirement);
+    return task;
+  }
+
+  function shutdownForHost(reason = "MCP host shutdown"): Promise<void> {
+    if (hostShutdownPromise) return hostShutdownPromise;
+    let resolveShutdown!: () => void, rejectShutdown!: (error: unknown) => void;
+    hostShutdownPromise = new Promise<void>((resolve, reject) => { resolveShutdown = resolve; rejectShutdown = reject; });
+    hostStopped = true;
+    ++lifecycleGeneration;
+    const capturedState = state;
+    state = null;
+    currentOwner = null;
+    currentOAuthRuntime = null;
+    initPromise = null;
+    clearRetainedInitFailure();
+    const cleanup = [...ownedRuntimes].map(([owner, oauthRuntime]) => retireOwnedRuntime(owner, oauthRuntime, reason));
+    void (async () => {
+      const results = await Promise.allSettled([...cleanup, shutdownState(capturedState, reason)]);
+      while (initializationTails.size) await Promise.allSettled([...initializationTails.values()]);
+      const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      failures.push(...shutdownFailures);
+      if (failures.length) throw new AggregateError(failures, "MCP host shutdown cleanup failed");
+      ownedRuntimes.clear();
+    })().then(resolveShutdown, rejectShutdown);
+    return hostShutdownPromise;
+  }
+  options.onLifecycle?.({ shutdown: shutdownForHost });
 
   function retainInitFailure(error: unknown): string {
     const message = truncateAtWord(formatTerminalError(error), INIT_FAILURE_MESSAGE_MAX_CHARS);
@@ -166,9 +223,10 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   }
 
   function startGatewayRetryInitialization(ctx: ExtensionContext): void {
+    if (hostStopped) return;
+    if (shutdownFailures.length) throw new Error("MCP cleanup failed; replacement remains fenced until explicit host recovery");
     const generation = ++lifecycleGeneration;
-    const owner = createMcpRuntimeOwner();
-    const oauthRuntime = createOAuthRuntime(owner.signal);
+    const { owner, oauthRuntime } = newOwnedRuntime();
     currentOwner = owner;
     currentOAuthRuntime = oauthRuntime;
     state = null;
@@ -176,42 +234,22 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   }
 
   async function shutdownState(currentState: McpExtensionState | null, reason: string): Promise<void> {
+    const failures: unknown[] = [];
+    try { publishMcpStatusShutdown(currentState?.statusEvents ?? pi.events); } catch (error) { failures.push(error); }
     if (!currentState) {
-      publishMcpStatusShutdown(pi.events);
+      if (failures.length) throw new AggregateError(failures, "MCP state cleanup failed");
       return;
     }
-
-    publishMcpStatusShutdown(currentState.statusEvents);
-
-    if (currentState.uiServer) {
-      currentState.uiServer.close(reason);
+    try {
+      currentState.uiServer?.close(reason);
       currentState.uiServer = null;
-    }
-
-    let flushError: unknown;
+    } catch (error) { failures.push(error); }
+    try { flushMetadataCache(currentState); } catch (error) { failures.push(error); }
     try {
-      flushMetadataCache(currentState);
-    } catch (error) {
-      flushError = error;
-    }
-
-    try {
-      if (currentState.owner) {
-        await currentState.owner.stop(reason);
-      } else {
-        await currentState.lifecycle.gracefulShutdown();
-      }
-    } catch (error) {
-      if (flushError) {
-        console.error(`MCP: graceful shutdown failed after metadata flush error: ${formatTerminalError(error)}`);
-      } else {
-        throw error;
-      }
-    }
-
-    if (flushError) {
-      throw flushError;
-    }
+      if (currentState.owner) await currentState.owner.stop(reason);
+      else await currentState.lifecycle.gracefulShutdown();
+    } catch (error) { failures.push(error); }
+    if (failures.length) throw new AggregateError(failures, "MCP state cleanup failed");
   }
 
   const earlyConfigPath = programmaticConfig
@@ -572,11 +610,12 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     });
     initPromise = promise;
 
-    return promise.then(async (nextState) => {
+    const completion = promise.then(async (nextState) => {
       if (!owner.isActive() || generation !== lifecycleGeneration || initPromise !== promise) {
         try {
           await shutdownState(nextState, staleReason);
         } catch (error) {
+          shutdownFailures.push(error);
           console.error(`MCP: failed to clean stale initialization state: ${formatTerminalError(error)}`);
         }
         return;
@@ -630,9 +669,23 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           shutdownOAuth(oauthRuntime),
         ]);
       } catch (error) {
+        shutdownFailures.push(error);
         console.error(`MCP: failed to clean rejected initialization: ${formatTerminalError(error)}`);
       }
     });
+    initializationTails.set(owner, completion);
+    void completion.then(async () => {
+      initializationTails.delete(owner);
+      // Failed initialization can be retried without retaining settled owners.
+      if (!hostStopped && !owner.isActive() && ownedRuntimes.has(owner)) {
+        try { await retireOwnedRuntime(owner, oauthRuntime, "MCP initialization retired"); }
+        catch (error) { shutdownFailures.push(error); }
+      }
+    }, error => {
+      shutdownFailures.push(error);
+      initializationTails.delete(owner);
+    });
+    return completion;
   }
 
   function startLoadTimeInitialization(): void {
@@ -642,10 +695,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     });
     if (!hasStartupServer) return;
     setImmediate(() => {
-      if (lifecycleGeneration !== 0 || state || initPromise) return;
+      if (hostStopped || lifecycleGeneration !== 0 || state || initPromise) return;
       const generation = ++lifecycleGeneration;
-      const owner = createMcpRuntimeOwner();
-      const oauthRuntime = createOAuthRuntime(owner.signal);
+      const { owner, oauthRuntime } = newOwnedRuntime();
       currentOwner = owner;
       currentOAuthRuntime = oauthRuntime;
       startInitialization({
@@ -660,12 +712,13 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    if (hostStopped) throw new Error("MCP adapter installation was shut down by its host");
+    if (shutdownFailures.length) throw new Error("MCP cleanup failed; replacement remains fenced until explicit host recovery");
     const generation = ++lifecycleGeneration;
     const previousState = state;
     const previousOwner = currentOwner;
     const previousOAuthRuntime = currentOAuthRuntime;
-    const owner = createMcpRuntimeOwner();
-    const oauthRuntime = createOAuthRuntime(owner.signal);
+    const { owner, oauthRuntime } = newOwnedRuntime();
     currentOwner = owner;
     currentOAuthRuntime = oauthRuntime;
     state = null;
@@ -674,15 +727,17 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
 
     // Abort synchronously before awaiting cleanup so old callbacks and startup
     // work cannot resume into a stale ExtensionContext.
-    const stopPrevious = previousOwner?.stop("MCP extension session restarted") ?? Promise.resolve();
+    const stopPrevious = previousOwner && previousOAuthRuntime
+      ? retireOwnedRuntime(previousOwner, previousOAuthRuntime, "MCP extension session restarted")
+      : Promise.resolve();
     try {
-      await Promise.all([
-        stopPrevious,
-        shutdownState(previousState, "session_restart"),
-        previousOAuthRuntime ? shutdownOAuth(previousOAuthRuntime) : Promise.resolve(),
-      ]);
+      const results = await Promise.allSettled([stopPrevious, shutdownState(previousState, "session_restart")]);
+      const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length) throw new AggregateError(failures, "MCP previous runtime cleanup failed");
     } catch (error) {
-      console.error(`MCP: failed to shut down previous session state: ${formatTerminalError(error)}`);
+      shutdownFailures.push(error);
+      await Promise.allSettled([owner.stop("MCP previous runtime cleanup failed"), shutdownOAuth(oauthRuntime)]);
+      throw new Error("MCP previous runtime cleanup failed; replacement remains fenced", { cause: error });
     }
 
     if (generation !== lifecycleGeneration || !owner.isActive()) return;
@@ -724,6 +779,12 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   });
 
   pi.on("session_shutdown", async () => {
+    if (hostStopped) {
+      try { await shutdownForHost(); } catch (error) {
+        console.error(`MCP: session shutdown cleanup failed: ${formatTerminalError(error)}`);
+      }
+      return;
+    }
     ++lifecycleGeneration;
     const currentState = state;
     const owner = currentOwner;
@@ -736,14 +797,15 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
 
     // Abort before awaiting cleanup so delayed initialization cannot touch stale
     // Pi context after session shutdown.
-    const stopOwner = owner?.stop("MCP extension session shutdown") ?? Promise.resolve();
+    const stopOwner = owner && oauthRuntime
+      ? retireOwnedRuntime(owner, oauthRuntime, "MCP extension session shutdown")
+      : Promise.resolve();
     try {
-      await Promise.all([
-        stopOwner,
-        shutdownState(currentState, "session_shutdown"),
-        oauthRuntime ? shutdownOAuth(oauthRuntime) : Promise.resolve(),
-      ]);
+      const results = await Promise.allSettled([stopOwner, shutdownState(currentState, "session_shutdown")]);
+      const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length) throw new AggregateError(failures, "MCP session cleanup failed");
     } catch (error) {
+      shutdownFailures.push(error);
       console.error(`MCP: session shutdown cleanup failed: ${formatTerminalError(error)}`);
     }
   });
@@ -1263,6 +1325,7 @@ export function createMcpAdapter(options: McpAdapterOptions = {}) {
       ...(factoryConfig !== undefined ? { config: cloneMcpConfig(factoryConfig) } : {}),
       ...(options.resolveRuntimeEnv !== undefined ? { resolveRuntimeEnv: options.resolveRuntimeEnv } : {}),
       ...(options.initializeOnLoad !== undefined ? { initializeOnLoad: options.initializeOnLoad } : {}),
+      ...(options.onLifecycle !== undefined ? { onLifecycle: options.onLifecycle } : {}),
     });
   };
 }

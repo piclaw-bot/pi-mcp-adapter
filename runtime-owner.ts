@@ -6,6 +6,8 @@ export interface McpRuntimeOwner {
   isActive(): boolean;
   addCleanup(cleanup: () => void | Promise<void>): void;
   stop(reason?: string): Promise<void>;
+  /** Await cleanups registered after stop, once admitted initialization settles. */
+  awaitCleanup(): Promise<void>;
   throwIfInactive(): void;
 }
 
@@ -13,6 +15,8 @@ export function createMcpRuntimeOwner(): McpRuntimeOwner {
   const controller = new AbortController();
   const cleanups: Array<() => void | Promise<void>> = [];
   let stopPromise: Promise<void> | undefined;
+  const lateCleanups = new Set<Promise<void>>();
+  const lateFailures: unknown[] = [];
 
   const reportCleanupFailure = (error: unknown, late: boolean) => {
     console.error(`MCP: ${late ? "late " : ""}runtime cleanup failed: ${formatTerminalError(error)}`);
@@ -23,26 +27,42 @@ export function createMcpRuntimeOwner(): McpRuntimeOwner {
     isActive: () => !controller.signal.aborted,
     addCleanup: cleanup => {
       if (controller.signal.aborted) {
-        void Promise.resolve().then(cleanup).catch(error => reportCleanupFailure(error, true));
+        const task = Promise.resolve().then(cleanup).then(() => {}, error => {
+          lateFailures.push(error);
+          reportCleanupFailure(error, true);
+        });
+        lateCleanups.add(task);
+        void task.then(() => lateCleanups.delete(task));
         return;
       }
       cleanups.push(cleanup);
     },
     stop: (reason = "MCP extension runtime stopped") => {
       if (stopPromise) return stopPromise;
+      let resolveStop!: () => void, rejectStop!: (error: unknown) => void;
+      stopPromise = new Promise<void>((resolve, reject) => { resolveStop = resolve; rejectStop = reject; });
+      // Abort listeners may synchronously reenter stop; publish settlement first.
       controller.abort(new Error(reason));
       const pendingCleanups = cleanups.splice(0).reverse().map(cleanup =>
         Promise.resolve().then(cleanup),
       );
-      stopPromise = Promise.allSettled(pendingCleanups).then(results => {
+      void Promise.allSettled(pendingCleanups).then(results => {
         const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
         if (failures.length > 0) {
           const aggregate = new AggregateError(failures, "MCP runtime cleanup failed");
           console.error(`MCP: runtime cleanup failed: ${formatTerminalError(aggregate)}`);
           throw aggregate;
         }
-      });
+      }).then(resolveStop, rejectStop);
       return stopPromise;
+    },
+    awaitCleanup: async () => {
+      if (!controller.signal.aborted) throw new Error("MCP runtime must be stopped before awaiting cleanup");
+      const failures: unknown[] = [];
+      try { await stopPromise; } catch (error) { failures.push(error); }
+      while (lateCleanups.size) await Promise.all([...lateCleanups]);
+      failures.push(...lateFailures);
+      if (failures.length) throw new AggregateError(failures, "MCP runtime cleanup failed");
     },
     throwIfInactive: () => controller.signal.throwIfAborted(),
   };

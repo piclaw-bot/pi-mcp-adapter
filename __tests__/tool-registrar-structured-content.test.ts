@@ -1,5 +1,21 @@
-import fs, { existsSync, readFileSync, statSync } from "node:fs";
-import { syncBuiltinESMExports } from "node:module";
+import { existsSync, readFileSync, statSync } from "node:fs";
+
+// Preserve the fault oracle under Bun, where syncBuiltinESMExports is a no-op.
+const filesystemFaults = vi.hoisted(() => ({ write: false, remove: false }));
+vi.mock("node:fs", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    writeFileSync: (...args: Parameters<typeof actual.writeFileSync>) => {
+      if (filesystemFaults.write) throw new Error("disk full");
+      return actual.writeFileSync(...args);
+    },
+    rmSync: (...args: Parameters<typeof actual.rmSync>) => {
+      if (filesystemFaults.remove) throw new Error("file busy");
+      return actual.rmSync(...args);
+    },
+  };
+});
 import { dirname } from "node:path";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import {
@@ -117,11 +133,9 @@ describe("resolveMcpResultContent", () => {
 
   it("restores quota when a failed write leaves no file", () => {
     const byteLength = vi.spyOn(Buffer, "byteLength").mockReturnValue(10 * 1024 * 1024);
-    const originalWriteFileSync = fs.writeFileSync;
 
     try {
-      fs.writeFileSync = (() => { throw new Error("disk full"); }) as typeof fs.writeFileSync;
-      syncBuiltinESMExports();
+      filesystemFaults.write = true;
       const failed = resolveMcpResultContent({
         content: [{ type: "resource", resource: { uri: "test://failure", blob: "YQ==" } }],
       });
@@ -130,8 +144,7 @@ describe("resolveMcpResultContent", () => {
         text: expect.stringContaining("Binary content omitted: could not be saved"),
       });
 
-      fs.writeFileSync = originalWriteFileSync;
-      syncBuiltinESMExports();
+      filesystemFaults.write = false;
       for (let i = 0; i < 10; i++) {
         const result = resolveMcpResultContent({
           content: [{ type: "resource", resource: { uri: `test://retry-${i}`, blob: "YQ==" } }],
@@ -142,8 +155,7 @@ describe("resolveMcpResultContent", () => {
         });
       }
     } finally {
-      fs.writeFileSync = originalWriteFileSync;
-      syncBuiltinESMExports();
+      filesystemFaults.write = false;
       byteLength.mockRestore();
     }
   });
@@ -156,14 +168,11 @@ describe("resolveMcpResultContent", () => {
     const path = text.match(/Binary content saved to (.+)/)?.[1];
     expect(path).toBeDefined();
 
-    const originalRmSync = fs.rmSync;
     try {
-      fs.rmSync = (() => { throw new Error("file busy"); }) as typeof fs.rmSync;
-      syncBuiltinESMExports();
+      filesystemFaults.remove = true;
       expect(() => cleanupMaterializedBinaryResources()).toThrow("Failed to clean materialized MCP resources");
     } finally {
-      fs.rmSync = originalRmSync;
-      syncBuiltinESMExports();
+      filesystemFaults.remove = false;
     }
 
     expect(existsSync(dirname(path!))).toBe(true);
@@ -180,14 +189,11 @@ describe("resolveMcpResultContent", () => {
     const path = text.match(/Binary content saved to (.+)/)?.[1];
     expect(path).toBeDefined();
 
-    const originalRmSync = fs.rmSync;
     try {
-      fs.rmSync = (() => { throw new Error("file busy"); }) as typeof fs.rmSync;
-      syncBuiltinESMExports();
+      filesystemFaults.remove = true;
       expect(() => cleanupMaterializedBinaryResources(scope)).toThrow("Failed to clean materialized MCP resources");
     } finally {
-      fs.rmSync = originalRmSync;
-      syncBuiltinESMExports();
+      filesystemFaults.remove = false;
     }
 
     expect(existsSync(dirname(path!))).toBe(true);
@@ -205,15 +211,12 @@ describe("resolveMcpResultContent", () => {
     const path = text.match(/Binary content saved to (.+)/)?.[1];
     expect(path).toBeDefined();
 
-    const originalRmSync = fs.rmSync;
     try {
-      fs.rmSync = (() => { throw new Error("file busy"); }) as typeof fs.rmSync;
-      syncBuiltinESMExports();
+      filesystemFaults.remove = true;
       expect(() => cleanupMaterializedBinaryResources(scope)).toThrow("Failed to clean materialized MCP resources");
       expect(existsSync(dirname(path!))).toBe(true);
 
-      fs.rmSync = originalRmSync;
-      syncBuiltinESMExports();
+      filesystemFaults.remove = false;
       const active = resolveMcpResultContent({
         content: [{ type: "resource", resource: { uri: "test://default-active", blob: "Yg==" } }],
       });
@@ -226,8 +229,7 @@ describe("resolveMcpResultContent", () => {
       cleanupMaterializedBinaryResources();
       expect(existsSync(dirname(activePath!))).toBe(false);
     } finally {
-      fs.rmSync = originalRmSync;
-      syncBuiltinESMExports();
+      filesystemFaults.remove = false;
       vi.useRealTimers();
     }
   });
@@ -241,10 +243,8 @@ describe("resolveMcpResultContent", () => {
     const path = text.match(/Binary content saved to (.+)/)?.[1];
     expect(path).toBeDefined();
 
-    const originalRmSync = fs.rmSync;
     try {
-      fs.rmSync = (() => { throw new Error("file busy"); }) as typeof fs.rmSync;
-      syncBuiltinESMExports();
+      filesystemFaults.remove = true;
       expect(() => cleanupMaterializedBinaryResources()).toThrow("Failed to clean materialized MCP resources");
       expect(vi.getTimerCount()).toBe(1);
 
@@ -256,8 +256,7 @@ describe("resolveMcpResultContent", () => {
       expect(vi.getTimerCount()).toBe(0);
       expect(existsSync(dirname(path!))).toBe(true);
     } finally {
-      fs.rmSync = originalRmSync;
-      syncBuiltinESMExports();
+      filesystemFaults.remove = false;
       cleanupMaterializedBinaryResources();
       vi.useRealTimers();
     }

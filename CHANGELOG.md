@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Public per-installation `createMcpAdapter({ onLifecycle })` shutdown handle for hosts that must await authoritative old-owner cleanup before admitting a replacement.
+
 ### Fixed
+- Retain cleanup failures and drain pending initialization, OAuth operations and late cleanup before host shutdown acknowledgement. Concurrent and reentrant abort listeners share one settlement; failed session teardown fences replacement.
+- Qualify the existing adapter tests under Bun using public mock-importer normalization, private fixture homes and explicit filesystem fault injection.
 - Hardened MCP 2026 multi-round input flows across proxy, direct, resource, and UI-resource calls, with actionable no-UI errors and cancellation cleanup.
 - Hardened MCP 2026-07-28 catalog listens with visible drop/recovery state, bounded re-listen on activity, resource update signals for open UIs, and quiet metadata/cache refreshes. (#468)
 - Implicit OAuth now reuses URL-bound stored credentials while preserving anonymous fallback. Thanks to [@wilt00](https://github.com/wilt00) for #471.
