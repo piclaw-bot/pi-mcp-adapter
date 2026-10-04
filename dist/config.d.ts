@@ -17,6 +17,12 @@ interface ConfigSourceSpec {
     shared: boolean;
     scope: "global" | "project";
 }
+/** Virtually replace only the highest-precedence project Pi document.
+ * Absent keeps disk discovery unchanged; null removes that layer for this read.
+ * This does not grant project trust or resolve credentials/commands. */
+export interface McpConfigLoadOptions {
+    projectOverride?: Readonly<Record<string, unknown>> | null;
+}
 export interface ConfigDiscoveryPath {
     label: string;
     path: string;
@@ -96,7 +102,7 @@ export declare function getMcpDiscoverySummary(overridePath?: string, cwd?: stri
     includeHostConfigs?: boolean;
 }): McpDiscoverySummary;
 export declare function cloneMcpConfig(config: McpConfig): McpConfig;
-export declare function loadMcpConfig(overridePath?: string, cwd?: string): McpConfig;
+export declare function loadMcpConfig(overridePath?: string, cwd?: string, options?: McpConfigLoadOptions): McpConfig;
 export interface ServerDisabledOverrideResult {
     path: string;
     changed: boolean;
@@ -117,7 +123,7 @@ export declare function previewStarterProjectConfig(cwd?: string): ConfigWritePr
 export declare function writeStarterProjectConfig(cwd?: string): string;
 export declare function previewSharedServerEntry(filePath: string, serverName: string, entry: ServerEntry): ConfigWritePreview;
 export declare function writeSharedServerEntry(filePath: string, serverName: string, entry: ServerEntry): string;
-export declare function getServerProvenance(overridePath?: string, cwd?: string): Map<string, ServerProvenance>;
+export declare function getServerProvenance(overridePath?: string, cwd?: string, options?: McpConfigLoadOptions): Map<string, ServerProvenance>;
 export declare function writeDirectToolsConfig(changes: Map<string, true | string[] | false>, provenance: Map<string, ServerProvenance>, fullConfig: McpConfig): void;
 export declare function resolveConfiguredOAuthDir(raw: unknown, cwd?: string): string | undefined;
 export {};

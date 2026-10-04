@@ -1,5 +1,5 @@
 // config.ts - Config loading with import support
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
@@ -81,6 +81,45 @@ const IMPORT_PATHS = {
     windsurf: [join(homedir(), ".windsurf", "mcp.json")],
     vscode: [".vscode/mcp.json"],
 };
+function assertDistinctProjectOverrideTarget(overridePath, cwd, options) {
+    if (!options)
+        return;
+    const project = getProjectPiConfigPath(cwd);
+    const identity = (path) => existsSync(path) ? realpathSync(path) : resolve(path);
+    if (getConfigSources(overridePath, cwd).some(source => source.id !== 'pi-project' && identity(source.readPath) === identity(project))) {
+        throw new Error('Virtual MCP project override requires a distinct project Pi configuration target.');
+    }
+}
+function captureLoadOptions(options) {
+    if (!options || !Object.hasOwn(options, 'projectOverride') || isExclusiveConfigMode())
+        return undefined;
+    if (options.projectOverride === null)
+        return { projectOverride: null };
+    const raw = options.projectOverride;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw))
+        throw new Error('Invalid virtual MCP project override.');
+    let copy;
+    try {
+        copy = structuredClone(raw);
+    }
+    catch {
+        throw new Error('Invalid virtual MCP project override.');
+    }
+    const invalidServers = ['mcpServers', 'mcp-servers'].some(key => Object.hasOwn(copy, key) && (!copy[key] || typeof copy[key] !== 'object' || Array.isArray(copy[key])
+        || Object.values(copy[key]).some(entry => !entry || typeof entry !== 'object' || Array.isArray(entry))));
+    if (invalidServers
+        || (copy.settings !== undefined && (!copy.settings || typeof copy.settings !== 'object' || Array.isArray(copy.settings)))
+        || (copy.imports !== undefined && (!Array.isArray(copy.imports) || copy.imports.some(kind => typeof kind !== 'string' || !Object.hasOwn(IMPORT_PATHS, kind))))) {
+        throw new Error('Invalid virtual MCP project override.');
+    }
+    return { projectOverride: copy };
+}
+function readConfigSource(source, options) {
+    if (source.id === 'pi-project' && options && Object.hasOwn(options, 'projectOverride')) {
+        return options.projectOverride === null ? null : validateConfig(options.projectOverride);
+    }
+    return readValidatedConfig(source.readPath, `MCP config from ${source.readPath}`);
+}
 export function getPiGlobalConfigPath(overridePath) {
     return overridePath ? resolve(overridePath) : getAgentPath("mcp.json");
 }
@@ -197,9 +236,11 @@ export function getMcpDiscoverySummary(overridePath, cwd = process.cwd(), option
 export function cloneMcpConfig(config) {
     return structuredClone(config);
 }
-export function loadMcpConfig(overridePath, cwd = process.cwd()) {
+export function loadMcpConfig(overridePath, cwd = process.cwd(), options) {
+    const captured = captureLoadOptions(options);
+    assertDistinctProjectOverrideTarget(overridePath, cwd, captured);
     const sourceSpecs = getConfigSources(overridePath, cwd);
-    const hostConfigDiscovery = getConfiguredHostConfigDiscovery(overridePath, cwd);
+    const hostConfigDiscovery = getConfiguredHostConfigDiscovery(overridePath, cwd, captured);
     // Host files are a lower-precedence fallback. This ordering means an opt-in
     // discovery cannot override a shared or Pi-owned definition, and all normal
     // URL-bound credential stripping remains in mergeServerMaps.
@@ -207,7 +248,7 @@ export function loadMcpConfig(overridePath, cwd = process.cwd()) {
         ? loadDiscoveredHostConfigs(cwd)
         : { mcpServers: {} };
     for (const source of sourceSpecs) {
-        const loaded = readValidatedConfig(source.readPath, `MCP config from ${source.readPath}`);
+        const loaded = readConfigSource(source, captured);
         if (!loaded)
             continue;
         config = mergeConfigs(config, expandImports(loaded, cwd));
@@ -219,18 +260,18 @@ export function loadMcpConfig(overridePath, cwd = process.cwd()) {
     const packageServers = Object.fromEntries(Object.entries(packageConfig.mcpServers).filter(([name]) => !Object.hasOwn(pluginConfig.mcpServers, name)));
     return mergeConfigs({ mcpServers: packageServers }, mergeConfigs(pluginConfig, config));
 }
-function getMergedSettings(overridePath, cwd = process.cwd()) {
+function getMergedSettings(overridePath, cwd = process.cwd(), options) {
     let settings;
     for (const source of getConfigSources(overridePath, cwd)) {
-        const loaded = readValidatedConfig(source.readPath, `MCP config from ${source.readPath}`);
+        const loaded = readConfigSource(source, options);
         if (loaded?.settings)
             settings = { ...settings, ...loaded.settings };
     }
     return settings;
 }
-function getConfiguredHostConfigDiscovery(overridePath, cwd = process.cwd()) {
+function getConfiguredHostConfigDiscovery(overridePath, cwd = process.cwd(), options) {
     let configured = "off";
-    const settings = getMergedSettings(overridePath, cwd);
+    const settings = getMergedSettings(overridePath, cwd, options);
     const value = settings?.hostConfigDiscovery;
     if (value === "off" || value === "prompt" || value === "on")
         configured = value;
@@ -1003,10 +1044,12 @@ export function writeSharedServerEntry(filePath, serverName, entry) {
     writeRawConfigObject(filePath, raw);
     return filePath;
 }
-export function getServerProvenance(overridePath, cwd = process.cwd()) {
+export function getServerProvenance(overridePath, cwd = process.cwd(), options) {
+    const captured = captureLoadOptions(options);
+    assertDistinctProjectOverrideTarget(overridePath, cwd, captured);
     const provenance = new Map();
     const userPath = getPiGlobalConfigPath(overridePath);
-    if (getConfiguredHostConfigDiscovery(overridePath, cwd) === "on") {
+    if (getConfiguredHostConfigDiscovery(overridePath, cwd, captured) === "on") {
         for (const importKind of Object.keys(IMPORT_PATHS)) {
             const imported = loadImportedConfig(importKind, cwd, `Failed to inspect imported MCP config from ${importKind}:`);
             if (!imported)
@@ -1019,7 +1062,7 @@ export function getServerProvenance(overridePath, cwd = process.cwd()) {
         }
     }
     for (const source of getConfigSources(overridePath, cwd)) {
-        const loaded = readValidatedConfig(source.readPath, `MCP config from ${source.readPath}`);
+        const loaded = readConfigSource(source, captured);
         if (!loaded)
             continue;
         if (loaded.imports?.length) {
