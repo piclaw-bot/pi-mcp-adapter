@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { getAgentDir } from "../agent-dir.ts";
 
-it("Bun setup clears inherited outside profiles before fixture capture", () => {
+it.skipIf(!process.versions.bun)("Bun setup clears inherited outside profiles before fixture capture", () => {
   expect(process.env.HOME).toContain("adapter-bun-suite-");
   expect(process.env.PI_CODING_AGENT_DIR).toBeUndefined();
   expect(process.env.PI_PACKAGE_DIR).toBeUndefined();
