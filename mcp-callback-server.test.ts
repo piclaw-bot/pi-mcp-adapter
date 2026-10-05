@@ -33,6 +33,36 @@ async function getFreePort(): Promise<number> {
   return address.port
 }
 
+/** Occupy both loopback families: Bun can resolve successive localhost binds differently. */
+async function occupyLoopbackPort(port: number): Promise<() => Promise<void>> {
+  const blockers: ReturnType<typeof createServer>[] = []
+  try {
+    for (const host of ["127.0.0.1", "::1"]) {
+      const blocker = createServer((_req, res) => {
+        res.writeHead(200)
+        res.end("blocked")
+      })
+      try {
+        await new Promise<void>((resolve, reject) => {
+          blocker.once("error", reject)
+          blocker.listen(port, host, resolve)
+        })
+        blockers.push(blocker)
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (host === "::1" && (code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL")) continue
+        throw error
+      }
+    }
+  } catch (error) {
+    await Promise.all(blockers.map(blocker => new Promise<void>(resolve => blocker.close(() => resolve()))))
+    throw error
+  }
+  return async () => {
+    await Promise.all(blockers.map(blocker => new Promise<void>(resolve => blocker.close(() => resolve()))))
+  }
+}
+
 describe("mcp-callback-server", () => {
   beforeEach(async () => {
     // Stop any running server before each test
@@ -93,15 +123,7 @@ describe("mcp-callback-server", () => {
 
     it("should release reserved callback state when strict binding fails", async () => {
       const port = await getFreePort()
-      const blocker = createServer((_req, res) => {
-        res.writeHead(200)
-        res.end("blocked")
-      })
-
-      await new Promise<void>((resolve, reject) => {
-        blocker.once("error", reject)
-        blocker.listen(port, "localhost", resolve)
-      })
+      const releaseBlockers = await occupyLoopbackPort(port)
 
       try {
         await assert.rejects(
@@ -109,7 +131,7 @@ describe("mcp-callback-server", () => {
           /already in use/
         )
       } finally {
-        await new Promise<void>((resolve) => blocker.close(() => resolve()))
+        await releaseBlockers()
       }
 
       await ensureCallbackServer({ callbackPath: "/after-failure" })
@@ -134,15 +156,7 @@ describe("mcp-callback-server", () => {
 
     it("should reject an occupied explicit strict port", async () => {
       const port = await getFreePort()
-      const blocker = createServer((_req, res) => {
-        res.writeHead(200)
-        res.end("blocked")
-      })
-
-      await new Promise<void>((resolve, reject) => {
-        blocker.once("error", reject)
-        blocker.listen(port, "localhost", resolve)
-      })
+      const releaseBlockers = await occupyLoopbackPort(port)
 
       try {
         await assert.rejects(
@@ -150,26 +164,13 @@ describe("mcp-callback-server", () => {
           /already in use/
         )
       } finally {
-        await new Promise<void>((resolve) => blocker.close(() => resolve()))
+        await releaseBlockers()
       }
     })
 
     it("should use an OS-assigned port when the configured non-strict port is occupied", async () => {
       const configuredPort = getConfiguredOAuthCallbackPort()
-      const blocker = createServer((_req, res) => {
-        res.writeHead(200)
-        res.end("blocked")
-      })
-
-      try {
-        await new Promise<void>((resolve, reject) => {
-          blocker.once("error", reject)
-          blocker.listen(configuredPort, "localhost", resolve)
-        })
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") return
-        throw error
-      }
+      const releaseBlockers = await occupyLoopbackPort(configuredPort)
 
       try {
         await ensureCallbackServer()
@@ -187,7 +188,7 @@ describe("mcp-callback-server", () => {
           /already in use/
         )
       } finally {
-        await new Promise<void>((resolve) => blocker.close(() => resolve()))
+        await releaseBlockers()
       }
     })
   })
